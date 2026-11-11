@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -26,10 +27,11 @@ from ..models import (
     MaintenanceRule,
 )
 from ..timeutil import iso, utcnow
+from . import sensors
 from .usage import Usage, aircraft_totals, component_totals, current_installations, entity_usage
 
 STATUS_ORDER = {"overdue": 0, "due_soon": 1, "ok": 2}
-METRIC_LABELS = {"hours": "ч", "cycles": "цикл.", "days": "дн."}
+METRIC_LABELS = {"hours": "ч", "cycles": "цикл.", "days": "дн.", "events": "соб."}
 
 
 def applicable_rules(rules: list[MaintenanceRule], kind: str, entity) -> list[MaintenanceRule]:
@@ -116,6 +118,10 @@ class Evaluator:
                 t = self.totals(kind, entity)
                 used_h, used_c = t.hours, t.cycles
         used_d = max(0.0, (now - base_at).total_seconds() / 86400)
+        used_e = 0
+        if getattr(rule, "interval_events", None):     # падения/столкновения по датчикам
+            since = base_at if (rule.kind == "periodic" and last is not None) else None
+            used_e = sensors.count_events(self.s, kind, entity.id, since=since, before=now + timedelta(seconds=1))
         rate = self.rate(kind, entity)
 
         metrics = []
@@ -123,10 +129,11 @@ class Evaluator:
             ("hours", rule.interval_hours, rule.warn_hours, used_h, rate.hours),
             ("cycles", rule.interval_cycles, rule.warn_cycles, used_c, rate.cycles),
             ("days", rule.interval_days, rule.warn_days, used_d, 1.0),
+            ("events", getattr(rule, "interval_events", None), getattr(rule, "warn_events", None), used_e, 0.0),
         ):
             if not interval:
                 continue
-            warn = warn if warn is not None else interval * 0.1
+            warn = warn if warn is not None else (0 if metric == "events" else interval * 0.1)
             remaining = interval - used
             status = "overdue" if remaining <= 0 else ("due_soon" if remaining <= warn else "ok")
             days_left = None
@@ -155,6 +162,19 @@ class Evaluator:
         }
 
 
+RESOURCE_CODE = "RESOURCE"
+
+
+def resource_rule(entity):
+    """Индивидуальный ресурс экземпляра как регламент вида «назначенный ресурс» (id = 0)."""
+    h, c, d = entity.resource_hours, entity.resource_cycles, entity.resource_days
+    if not (h or c or d):
+        return None
+    return SimpleNamespace(id=0, code=RESOURCE_CODE, name="Индивидуальный ресурс (паспорт / формуляр)", kind="life",
+                           target=None, interval_hours=h, interval_cycles=c, interval_days=d, interval_events=None,
+                           warn_hours=None, warn_cycles=None, warn_days=None, warn_events=None, active=True)
+
+
 def due_items(s: Session, now: datetime | None = None, aircraft_id: int | None = None,
               component_id: int | None = None, statuses: set[str] | None = None,
               evaluator: Evaluator | None = None) -> list[dict]:
@@ -178,7 +198,8 @@ def due_items(s: Session, now: datetime | None = None, aircraft_id: int | None =
 
     items = []
     for kind, ent in targets:
-        for rule in applicable_rules(rules, kind, ent):
+        own = resource_rule(ent)
+        for rule in applicable_rules(rules, kind, ent) + ([own] if own else []):
             item = ev.evaluate(rule, kind, ent)
             if statuses is None or item["status"] in statuses:
                 items.append(item)

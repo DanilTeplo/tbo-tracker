@@ -18,7 +18,8 @@ from ..models import (
     Setting,
 )
 from ..timeutil import iso, parse_dt, utcnow
-from .maintenance import STATUS_ORDER, Evaluator, due_items
+from . import sensors
+from .maintenance import STATUS_ORDER, Evaluator, due_items, resource_rule
 from .usage import component_totals, component_usage, current_installations, installation_usage
 
 DEFAULT_ECONOMICS = {
@@ -30,6 +31,24 @@ DEFAULT_ECONOMICS = {
     "manual_minutes_per_operation": 20,  # поиск истории узла при перестановке/ТО вручную
     "engineer_rate": 1600,            # стоимость часа инженера, ₽
 }
+
+
+def estimate(kpi: dict, p: dict) -> dict:
+    """Калькулятор экономического эффекта (формулы показываются в интерфейсе)."""
+    p = {**DEFAULT_ECONOMICS, **(p or {})}
+    fail_loss = p["failure_cost"] + p["downtime_days_per_failure"] * p["downtime_cost_per_day"]
+    at_risk = kpi["prevented_misses"] + kpi["overdue_in_operation"]
+    risk = at_risk * p["failure_probability"] * fail_loss
+    flights_year = kpi["flights_90d"] * 365 / 90
+    ops_year = kpi["component_operations_90d"] * 365 / 90
+    labor_h = (flights_year * p["manual_minutes_per_flight"] + ops_year * p["manual_minutes_per_operation"]) / 60
+    labor = labor_h * p["engineer_rate"]
+    total = risk + labor
+    return {"params": p, "fail_loss": round(fail_loss, 2), "at_risk": at_risk, "risk": round(risk, 2),
+            "flights_year": round(flights_year, 1), "ops_year": round(ops_year, 1), "labor_hours": round(labor_h, 1),
+            "labor": round(labor, 2), "total": round(total, 2), "per_aircraft": round(total / max(1, kpi["aircraft"]), 2),
+            "prevented_misses": kpi["prevented_misses"], "overdue_in_operation": kpi["overdue_in_operation"],
+            "aircraft": kpi["aircraft"]}
 
 
 def _status(metrics_spec):
@@ -70,8 +89,8 @@ def analytics(s: Session, now: datetime | None = None) -> dict:
         tsn = totals[cid].hours
         if tsn - ob_h > 0.05:
             hidden_rows.append({"component_id": cid, "serial": c.serial, "type": c.type.name,
-                                "aircraft": inst.aircraft.name, "tsn_hours": round(tsn, 1),
-                                "on_board_hours": round(ob_h, 1), "hidden_hours": round(tsn - ob_h, 1),
+                                "aircraft": inst.aircraft.name, "tsn_hours": round(tsn, 2),
+                                "on_board_hours": round(ob_h, 2), "hidden_hours": round(tsn - ob_h, 2),
                                 "installed_at": iso(inst.installed_at)})
     hidden_rows.sort(key=lambda r: -r["hidden_hours"])
 
@@ -83,18 +102,23 @@ def analytics(s: Session, now: datetime | None = None) -> dict:
         inst = current.get(it["entity"]["id"])
         if inst is None:
             continue
-        rule = rules[it["rule"]["id"]]
+        rule = rules.get(it["rule"]["id"]) or resource_rule(comps[it["entity"]["id"]])
         base = parse_dt(it["base_at"])
         naive_base = max(base, inst.installed_at) if rule.kind == "periodic" else inst.installed_at
         u = component_usage(s, [inst.component_id], since=naive_base, aircraft_id=inst.aircraft_id).get(inst.component_id)
         nh, nc = (u.hours, u.cycles) if u else (0.0, 0)
         nd = (now - naive_base).total_seconds() / 86400
+        # «по борту» тоже видны удары этого борта с установки узла: без них каждый осмотр после удара
+        # засчитывался бы как предотвращённый пропуск (раздувая KPI и оценку эффекта)
+        ne = sensors.count_events(s, "aircraft", inst.aircraft_id, since=naive_base, before=now + timedelta(seconds=1)) \
+            if getattr(rule, "interval_events", None) else 0
         naive = _status([(rule.interval_hours, rule.warn_hours, nh), (rule.interval_cycles, rule.warn_cycles, nc),
-                         (rule.interval_days, rule.warn_days, nd)])
+                         (rule.interval_days, rule.warn_days, nd),
+                         (getattr(rule, "interval_events", None), getattr(rule, "warn_events", None) or 0, ne)])
         if STATUS_ORDER[naive] > STATUS_ORDER[it["status"]]:
             prevented.append({"entity": it["entity"], "rule": it["rule"], "real_status": it["status"],
                               "naive_status": naive, "driver": it["driver"],
-                              "naive_hours": round(nh, 1), "naive_cycles": nc})
+                              "naive_hours": round(nh, 2), "naive_cycles": nc})
 
     # --- 3. Перестановки и движение узлов
     installs = list(s.scalars(select(Installation)))
@@ -121,8 +145,13 @@ def analytics(s: Session, now: datetime | None = None) -> dict:
             flights_90 += 1
     months = sorted(monthly)
     ac_names = {a.id: a.name for a in aircraft}
-    monthly_series = [{"month": m, "by_aircraft": {ac_names[a]: round(h, 1) for a, h in monthly[m].items()},
-                       "total": round(sum(monthly[m].values()), 1)} for m in months]
+    monthly_series = []
+    for m in months:
+        by_name = defaultdict(float)          # одинаковые названия бортов не затирают друг друга, а суммируются
+        for a, h in monthly[m].items():
+            by_name[ac_names[a]] += h
+        monthly_series.append({"month": m, "by_aircraft": {n: round(h, 2) for n, h in by_name.items()},
+                               "total": round(sum(monthly[m].values()), 2)})
 
     # --- 5. Сводные показатели
     status_counts = {"overdue": 0, "due_soon": 0, "ok": 0}
@@ -136,18 +165,18 @@ def analytics(s: Session, now: datetime | None = None) -> dict:
     imports = s.scalar(select(func.count(LogImport.id))) or 0
     overdue_installed = [it for it in items if it["status"] == "overdue" and
                          (it["entity"]["kind"] == "aircraft" or it["entity"]["location"])]
-    return {
+    out = {
         "generated_at": iso(now),
         "kpi": {
             "aircraft": len([a for a in aircraft if a.status != "retired"]),
             "components": len([c for c in comps.values() if c.status != "retired"]),
             "components_installed": len(current),
             "components_reserve": len([c for c in comps.values() if c.status in ("stock", "maintenance")]),
-            "total_flights": total_flights, "total_hours": round(total_hours, 1),
+            "total_flights": total_flights, "total_hours": round(total_hours, 2),
             "flights_90d": flights_90, "maintenance_90d": maint_90,
             "component_operations_90d": ops_90,
             "components_moved": len(moved),
-            "hidden_hours_total": round(sum(r["hidden_hours"] for r in hidden_rows), 1),
+            "hidden_hours_total": round(sum(r["hidden_hours"] for r in hidden_rows), 2),
             "components_with_hidden_hours": len(hidden_rows),
             "prevented_misses": len(prevented),
             "duplicates_blocked": int(dup_blocked), "imports": imports,
@@ -157,6 +186,8 @@ def analytics(s: Session, now: datetime | None = None) -> dict:
         "hidden_hours": hidden_rows,
         "prevented": prevented,
         "monthly": monthly_series,
-        "aircraft_names": [a.name for a in aircraft],
+        "aircraft_names": list(dict.fromkeys(a.name for a in aircraft)),
         "economics": economics_settings(s),
     }
+    out["estimate"] = estimate(out["kpi"], out["economics"])
+    return out

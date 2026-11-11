@@ -1,7 +1,7 @@
 """Импорт журналов эксплуатации и автоматическое начисление наработки.
 
 Поддерживаемые форматы (см. docs/LOG_FORMAT.md):
-  * JSON  «sokol-flightlog/1.0» — журнал одного или нескольких бортов;
+  * JSON  «tbo-flightlog/1.0» — журнал одного или нескольких бортов;
   * CSV   — одна строка = один полёт (удобно для выгрузки из НСУ/Excel).
 
 Защита от двойного начисления — на двух уровнях:
@@ -23,21 +23,22 @@ from sqlalchemy.orm import Session
 
 from ..config import FUTURE_TOLERANCE_MIN, MAX_FLIGHT_HOURS
 from ..errors import DomainError
-from ..models import Aircraft, Flight, LogImport
+from ..models import Aircraft, Flight, LogImport, SensorEvent
 from ..timeutil import iso, parse_dt, utcnow
+from . import movements, sensors
 from .maintenance import Evaluator, due_items
 from .usage import installed_at
 
-FORMAT_ID = "sokol-flightlog/1.0"
+FORMAT_ID = "tbo-flightlog/1.0"
 
 
 class ParsedFlight(dict):
     pass
 
 
-def _row(aircraft_serial, flight_id, start, end, cycles=None, mission=None, pilot=None, line=None):
-    return ParsedFlight(aircraft_serial=(aircraft_serial or "").strip(), flight_id=(str(flight_id).strip() if flight_id not in (None, "") else None),
-                        start=start, end=end, cycles=cycles, mission=mission, pilot=pilot, line=line)
+def _row(aircraft_serial, flight_id, start, end, cycles=None, mission=None, pilot=None, line=None, extra=None):
+    return ParsedFlight(aircraft_serial=(str(aircraft_serial or "")).strip(), flight_id=(str(flight_id).strip() if flight_id not in (None, "") else None),
+                        start=start, end=end, cycles=cycles, mission=mission, pilot=pilot, line=line, extra=extra or {})
 
 
 def parse_log(content: bytes, filename: str) -> tuple[str, list[ParsedFlight], dict]:
@@ -68,7 +69,7 @@ def _parse_json(text: str):
         default_serial = None
     elif isinstance(data, dict):
         fmt = data.get("format")
-        if fmt and not str(fmt).startswith("sokol-flightlog/"):
+        if fmt and not str(fmt).startswith("tbo-flightlog/"):
             raise DomainError(f"Неизвестный формат журнала: {fmt}")
         meta = {k: data.get(k) for k in ("log_id", "source", "generated_at", "operator") if data.get(k)}
         default_serial = data.get("aircraft_serial")
@@ -82,8 +83,9 @@ def _parse_json(text: str):
         if not isinstance(f, dict):
             rows.append(_row(None, None, None, None, line=idx))
             continue
+        extra = {k: f[k] for k in ("imu", "events", "collisions", "falls") if k in f}
         rows.append(_row(f.get("aircraft_serial") or default_serial, f.get("flight_id"),
-                         f.get("start"), f.get("end"), f.get("cycles"), f.get("mission"), f.get("pilot"), idx))
+                         f.get("start"), f.get("end"), f.get("cycles"), f.get("mission"), f.get("pilot"), idx, extra))
     return "json", rows, meta
 
 
@@ -95,6 +97,8 @@ CSV_ALIASES = {
     "cycles": ("cycles", "циклы"),
     "mission": ("mission", "задание"),
     "pilot": ("pilot", "оператор"),
+    "collisions": ("collisions", "столкновения", "столкновений"),
+    "falls": ("falls", "падения", "падений"),
 }
 
 
@@ -104,7 +108,12 @@ def _parse_csv(text: str):
         raise DomainError("CSV не содержит данных")
     delim = ";" if lines[0].count(";") > lines[0].count(",") else ","
     reader = csv.DictReader(io.StringIO("\n".join(lines)), delimiter=delim)
-    headers = {h.strip().lower(): h for h in (reader.fieldnames or [])}
+    return "csv", rows_from_table(reader.fieldnames or [], list(reader)), {}
+
+
+def rows_from_table(fieldnames, records, what="CSV"):
+    """Строки таблицы (CSV / Excel / PDF) → записи полётов по синонимам колонок."""
+    headers = {str(h).strip().lower(): h for h in fieldnames if h is not None}
     colmap = {}
     for key, aliases in CSV_ALIASES.items():
         for a in aliases:
@@ -113,13 +122,14 @@ def _parse_csv(text: str):
                 break
     missing = [k for k in ("aircraft_serial", "start", "end") if k not in colmap]
     if missing:
-        raise DomainError(f"В CSV нет обязательных колонок: {', '.join(missing)}")
+        raise DomainError(f"В {what} нет обязательных колонок: {', '.join(missing)}")
     rows = []
-    for idx, r in enumerate(reader, 1):
-        g = lambda k: (r.get(colmap[k]) or "").strip() if k in colmap else None  # noqa: E731
+    for idx, r in enumerate(records, 1):
+        g = lambda k: (str(r.get(colmap[k]) if r.get(colmap[k]) is not None else "")).strip() if k in colmap else None  # noqa: E731
+        extra = {k: g(k) for k in ("collisions", "falls") if k in colmap and g(k)}
         rows.append(_row(g("aircraft_serial"), g("flight_id"), g("start"), g("end"),
-                         g("cycles") or None, g("mission") or None, g("pilot") or None, idx))
-    return "csv", rows, {}
+                         g("cycles") or None, g("mission") or None, g("pilot") or None, idx, extra))
+    return rows
 
 
 def _validate(rows, aircraft_by_serial, now):
@@ -147,11 +157,22 @@ def _validate(rows, aircraft_by_serial, now):
                 raise ValueError("полёт датирован будущим временем")
             if start < ac.in_service_at:
                 raise ValueError(f"полёт раньше ввода борта {ac.serial} в эксплуатацию")
-            cycles = 1 if r["cycles"] in (None, "") else int(float(r["cycles"]))
-            if cycles < 0 or cycles > 1000:
-                raise ValueError("некорректное число циклов")
+            try:
+                cyc = 1.0 if r["cycles"] in (None, "") else float(r["cycles"])
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(f"некорректное число циклов «{str(r['cycles'])[:20]}»") from None
+            if cyc != cyc or cyc < 0 or cyc > 1000 or cyc != int(cyc):
+                raise ValueError("число циклов должно быть целым от 0 до 1000")
+            cycles = int(cyc)
+            for fld, limit in (("mission", 300), ("pilot", 200)):
+                if r[fld] is not None and not isinstance(r[fld], (str, int, float)):
+                    raise ValueError(f"поле {fld} должно быть строкой")
+                r[fld] = None if r[fld] in (None, "") else str(r[fld])[:limit]
         except ValueError as e:
             errors.append(f"{where}: {e}")
+            continue
+        if r["flight_id"] and len(r["flight_id"]) > 200:
+            errors.append(f"{where}: flight_id длиннее 200 символов")
             continue
         ext = r["flight_id"] or "auto-" + hashlib.sha1(
             f"{ac.serial}|{start.isoformat()}|{end.isoformat()}".encode()).hexdigest()[:16]
@@ -164,8 +185,13 @@ def import_log(s: Session, content: bytes, filename: str, imported_by: str | Non
     """Импорт журнала в рамках текущей транзакции. При dry_run изменения откатываются вызывающим кодом."""
     now = utcnow()
     sha = hashlib.sha256(content).hexdigest()
-    prev = s.scalar(select(LogImport).where(LogImport.sha256 == sha, LogImport.status.in_(("imported", "partial")))
-                    .order_by(LogImport.id).limit(1))
+    # Файл целиком — повтор, только если в прошлый раз в нём не было отклонённых строк. Иначе (частичный
+    # импорт с ошибками) файл обрабатывается снова: после исправления данных (зарегистрировали борт или узел)
+    # применяются ранее отклонённые строки, а уже учтённые полёты и операции отсекает защита на уровне строк.
+    prev = s.scalar(select(LogImport).where(
+        LogImport.sha256 == sha,
+        (LogImport.status == "imported") | ((LogImport.status == "partial") & (LogImport.flights_rejected == 0)))
+        .order_by(LogImport.id).limit(1))
     if prev is not None:
         imp = LogImport(filename=filename, sha256=sha, format=prev.format, status="duplicate",
                         imported_at=now, imported_by=imported_by, duplicate_of_id=prev.id,
@@ -177,8 +203,44 @@ def import_log(s: Session, content: bytes, filename: str, imported_by: str | Non
             s.flush()
         return import_dict(imp, dry_run=dry_run)
 
+    # Excel / PDF: журнал движения узлов или журнал полётов в табличном виде
+    if content[:2] == b"PK" or content[:5] == b"%PDF-":
+        fmt = "xlsx" if content[:2] == b"PK" else "pdf"
+        try:
+            try:
+                tables = movements.tables_from_xlsx(content) if fmt == "xlsx" else movements.tables_from_pdf(content)
+            except DomainError:
+                raise
+            except Exception as e:  # noqa: BLE001 — повреждённый файл не должен давать 500
+                raise DomainError(f"Не удалось разобрать файл {fmt.upper()}: {type(e).__name__}") from e
+            kinds = {movements.classify(h) for h, _ in tables}
+            if not tables or kinds == {"unknown"}:
+                raise DomainError("Не найдена таблица журнала: нужны колонки «Дата, Операция, Узел, Борт, Позиция» "
+                                  "(движение узлов) или «Борт, Взлёт, Посадка» (полёты)")
+        except DomainError as e:
+            imp = LogImport(filename=filename, sha256=sha, format=fmt, status="rejected", imported_at=now,
+                            imported_by=imported_by, messages=[e.message], summary={})
+            if not dry_run:
+                s.add(imp)
+                s.flush()
+            return import_dict(imp, dry_run=dry_run)
+        if "movements" in kinds:
+            imp = LogImport(filename=filename, sha256=sha, format=f"{fmt}-движение", status="imported", imported_at=now,
+                            imported_by=imported_by, messages=[], summary={})
+            s.add(imp)
+            s.flush()
+            movements.import_movements(s, [t for t in tables if movements.classify(t[0]) == "movements"], imp, dry_run)
+            return import_dict(imp, dry_run=dry_run)
+        content_rows = []
+        for h, body in tables:
+            if movements.classify(h) == "flights":
+                content_rows += movements.as_records(h, body)
+        header = next(h for h, _ in tables if movements.classify(h) == "flights")
     try:
-        fmt, rows, meta = parse_log(content, filename)
+        if content[:2] == b"PK" or content[:5] == b"%PDF-":
+            rows, meta = rows_from_table(header, content_rows, "Excel/PDF"), {}
+        else:
+            fmt, rows, meta = parse_log(content, filename)
     except DomainError as e:
         imp = LogImport(filename=filename, sha256=sha, status="rejected", imported_at=now,
                         imported_by=imported_by, messages=[e.message], summary={})
@@ -202,6 +264,7 @@ def import_log(s: Session, content: bytes, filename: str, imported_by: str | Non
 
     duplicates = 0
     new_flights: list[Flight] = []
+    new_events: list = []
     seen_keys: set[tuple] = set()
     for r, ac, start, end, cycles, ext in sorted(valid, key=lambda v: v[2]):
         key = (ac.id, ext)
@@ -221,6 +284,15 @@ def import_log(s: Session, content: bytes, filename: str, imported_by: str | Non
                    duration_h=round((end - start).total_seconds() / 3600, 4), cycles=cycles,
                    mission=r["mission"], pilot=r["pilot"])
         s.add(f)
+        s.flush()
+        evs, warns = sensors.analyze_flight(start, r.get("extra"), end)
+        for w in warns:                     # полёт учитывается; неверная часть данных датчиков — с причиной
+            messages.append(f"запись {r['line']}: данные датчиков не учтены — {w}")
+        for ev in evs:
+            se = SensorEvent(flight_id=f.id, aircraft_id=ac.id, occurred_at=ev["at"], kind=ev["kind"],
+                             peak_g=ev["peak_g"], source=ev["source"], details=ev["details"])
+            s.add(se)
+            new_events.append((ac, se))
         s.flush()
         seen_keys.add(key)
         new_flights.append(f)
@@ -244,7 +316,7 @@ def import_log(s: Session, content: bytes, filename: str, imported_by: str | Non
         insts = installed_at(s, ac.id, f.started_at)
         filled = {i.position for i in insts}
         for slot in ac.type.slots or []:
-            if slot["position"] not in filled:
+            if slot.get("required", True) and slot["position"] not in filled:
                 incomplete[ac.id].add(slot["label"])
         for inst in insts:
             c = per_component.setdefault(inst.component_id, {
@@ -289,7 +361,12 @@ def import_log(s: Session, content: bytes, filename: str, imported_by: str | Non
                      for v in per_aircraft.values()],
         "components": [dict(v, hours=round(v["hours"], 2)) for v in per_component.values()],
         "alerts": alerts,
+        "sensor_events": [{"aircraft": ac.name, "aircraft_id": ac.id, "at": iso(e.occurred_at), "kind": e.kind,
+                           "kind_label": sensors.KIND_LABELS[e.kind], "peak_g": e.peak_g, "source": e.source} for ac, e in new_events],
     }
+    for ac, e in new_events:
+        messages.append(f"Датчики: {sensors.KIND_LABELS[e.kind].lower()} борта {ac.serial} {e.occurred_at:%d.%m.%Y %H:%M} UTC"
+                        + (f", пик {e.peak_g} g" if e.peak_g else ""))
     s.flush()
     return import_dict(imp, dry_run=dry_run)
 
@@ -306,6 +383,9 @@ def _due_snapshot(s: Session, aircraft_ids: set[int], now: datetime) -> dict:
 def rollback_import(s: Session, imp: LogImport) -> dict:
     if imp.status not in ("imported", "partial"):
         raise DomainError("Откатить можно только успешно выполненный импорт")
+    if (imp.summary or {}).get("kind") == "movements":
+        raise DomainError("Журнал движения узлов не откатывается целиком: исправьте установки и снятия операциями "
+                          "в карточках узлов (история перемещений сохраняется)")
     flights = list(s.scalars(select(Flight).where(Flight.import_id == imp.id)))
     for f in flights:
         s.delete(f)
