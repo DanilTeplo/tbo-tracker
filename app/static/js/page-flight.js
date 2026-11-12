@@ -33,7 +33,8 @@ function droneRunResultHTML(r) {
   const ok = r.status === "completed";
   return `<div class="notice ${ok ? "ok" : "bad"} mt-8"><b>Полёт R${r.id}: ${esc(r.status_label)}</b>${s.reason ? ` — ${esc(s.reason)}` : s.error ? ` — ${esc(s.error)}` : ""}
     ${s.duration_s ? `<br>Длительность ${fmtDur(s.duration_s)}, путь ${num((s.distance_m || 0) / 1000, 2)} км, макс. высота ${num(s.max_alt_m || 0, 0)} м, точек ${s.wp_reached ?? "—"} из ${s.wp_total ?? "—"}.` : ""}
-    ${r.import_id ? `<br>Журнал импортирован автоматически (импорт №${r.import_id}): начислено <b>${flightTime(s)}</b> наработки${s.components ? ` борту и ${s.components} узлам` : ""}${(s.sensor_events || []).length ? `; события датчиков: ${s.sensor_events.length}` : ""}. <a href="#/aircraft/${r.aircraft_id}">Открыть борт →</a>` : ""}</div>`;
+    ${r.import_id ? `<br>Журнал импортирован автоматически (импорт №${r.import_id}): начислено <b>${flightTime(s)}</b> наработки${s.components ? ` борту и ${s.components} узлам` : ""}${(s.sensor_events || []).length ? `; события датчиков: ${s.sensor_events.length}` : ""}. <a href="#/aircraft/${r.aircraft_id}">Открыть борт →</a>
+      <br><a href="/api/runs/${r.id}/report?fmt=md" download>⇩ Отчёт по полёту R${r.id}</a> · <a href="/api/runs/${r.id}/flightlog" download>⇩ Журнал полёта (для повторной загрузки)</a>` : ""}</div>`;
 }
 
 // Видео с борта (web_video_server на борту → сервер → страница). Включается кнопкой: поток ~2 Мбит/с и нагрузка
@@ -47,6 +48,48 @@ function droneVideoPanel(root) {
   }).catch(() => {});
 
   function stop(msg) { playing = false; note = msg || ""; render(true); }
+  // Кадры по одному: следующий — только после показа предыдущего. Прежний поток MJPEG при медленном Wi-Fi копил
+  // кадры в буферах сети, и картинка отставала на десятки секунд; так отставание не больше одного кадра.
+  let gen = 0;
+  async function pump(my, img, statsEl) {
+    let after = 0, prevUrl = null, shown = 0, since = performance.now(), lag = 0, boardLag = null;
+    const live = () => my === gen && playing && alive();
+    while (live()) {
+      const t0 = performance.now();
+      let r;
+      try {
+        r = await fetch(`/api/drones/${lid}/video/frame?stream=${encodeURIComponent(stream)}&after=${after}`,
+          { cache: "no-store", credentials: "same-origin" });
+      } catch (_) { if (live()) stop("Нет связи с сервером — видео остановлено."); break; }
+      if (!live()) break;
+      if (r.status === 204) continue;                     // нового кадра пока нет — сервер ждал его несколько секунд
+      if (!r.ok) {
+        let msg = r.status === 401 ? "Сеанс завершён — войдите снова" : "Поток с борта прервался";
+        try { msg = (await r.json()).detail || msg; } catch (_) { /* не JSON */ }
+        stop(`${msg}. Нажмите «Показать видео», чтобы подключиться снова.`);
+        break;
+      }
+      after = +r.headers.get("X-Frame-Seq") || after;
+      const age = +r.headers.get("X-Frame-Age-Ms") || 0;
+      const lagHdr = r.headers.get("X-Frame-Lag-Ms"), reconnects = +r.headers.get("X-Feed-Reconnects") || 0;
+      if (lagHdr !== null) boardLag = boardLag === null ? +lagHdr : boardLag * 0.8 + +lagHdr * 0.2;
+      const url = URL.createObjectURL(await r.blob());
+      await new Promise((res) => { img.onload = res; img.onerror = res; img.src = url; });
+      if (prevUrl) URL.revokeObjectURL(prevUrl);
+      prevUrl = url; shown += 1;
+      lag = lag ? lag * 0.8 + (age + performance.now() - t0) * 0.2 : age + performance.now() - t0;
+      const dt = performance.now() - since;
+      if (dt >= 1000 && statsEl) {
+        // отставание от борта — очередь кадров на борту и в Wi-Fi борт → сервер (по меткам web_video_server)
+        statsEl.textContent = `${num(shown * 1000 / dt, 1)} кадр/с`
+          + (boardLag !== null ? ` · отставание от борта ≈ ${num(boardLag, 0)} мс` : "")
+          + ` · сервер и сеть ≈ ${num(lag, 0)} мс`
+          + (reconnects ? ` · канал с бортом пересоздан ${reconnects} раз (слабый Wi-Fi)` : "");
+        shown = 0; since = performance.now();
+      }
+    }
+    if (prevUrl) URL.revokeObjectURL(prevUrl);
+  }
   async function start() {
     if (starting) return;
     const want = `${lid}|${stream}`;                     // за время проверки борт или поток могли смениться
@@ -64,15 +107,15 @@ function droneVideoPanel(root) {
     if (!force && key === shownKey) return;              // без изменений — не трогаем идущий поток
     shownKey = key;
     const opts = streams.map((s) => `<option value="${esc(s.id)}" ${s.id === stream ? "selected" : ""}>${esc(s.label)}</option>`).join("");
-    const src = `/api/drones/${lid}/video?stream=${encodeURIComponent(stream)}&t=${Date.now()}`;
+    gen += 1;                                              // прежний цикл кадров завершится сам
     root.innerHTML = `<div class="card-head"><h2>Видео с борта</h2><span class="small muted">${esc(name)}</span></div>
       <div class="video-ctl">${opts ? `<select data-vs class="w-auto" ${playing ? "disabled" : ""}>${opts}</select>` : ""}
         ${playing ? '<button data-vstop>■ Остановить</button>'
           : `<button class="primary" data-vplay ${online && !starting ? "" : "disabled"}>▶ Показать видео</button>`}</div>
       ${!online ? '<div class="notice warn mt-8">Борт не на связи — видео недоступно.</div>' : ""}
       ${note ? `<div class="notice ${/Подключение/.test(note) ? "" : "bad"} mt-8">${esc(note)}</div>` : ""}
-      ${playing ? `<div class="video-wrap mt-8"><img data-vimg alt="Видео с борта" src="${src}"></div>` : ""}
-      <div class="hint">Камера бортового компьютера через сервер (web_video_server, порт 8080). Поток ~2 Мбит/с; один просмотр — до ${maxMin} мин.</div>`;
+      ${playing ? `<div class="video-wrap mt-8"><img data-vimg alt="Видео с борта"></div><div class="small muted mt-8" data-vstat>Ожидание кадра…</div>` : ""}
+      <div class="hint">Камера бортового компьютера через сервер (web_video_server, порт 8080), 320×240. Кадры идут по одному: при медленной сети реже, но без отставания. Один просмотр — до ${maxMin} мин.</div>`;
     const sel = $("[data-vs]", root);
     if (sel) sel.onchange = () => { stream = sel.value; render(true); };
     const play = $("[data-vplay]", root);
@@ -80,7 +123,7 @@ function droneVideoPanel(root) {
     const st = $("[data-vstop]", root);
     if (st) st.onclick = () => stop("");
     const img = $("[data-vimg]", root);
-    if (img) img.onerror = () => { if (playing) stop("Поток с борта прервался — нажмите «Показать видео», чтобы подключиться снова."); };
+    if (img) pump(gen, img, $("[data-vstat]", root));
   }
   return {
     update(d) {                                           // состояние борта из панели полёта (раз в 1,5 с)

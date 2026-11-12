@@ -7,7 +7,7 @@
 
 | Интерфейс | Направление | Формат и протокол | Ограничения | Документ |
 |---|---|---|---|---|
-| API бортового агента `/api/agent/*` | агент ⇄ сервер | HTTPS (HTTP в закрытой сети), JSON; токен устройства в заголовке; долгий опрос команд; журнал полёта POST `/api/agent/runs/{id}/log` | агент видит только свой борт; входящие порты на борту не нужны; токен 256 бит, на сервере только хеш | [DRONE.md](DRONE.md), разделы 2, 7 |
+| API бортового агента `/api/agent/*` | агент ⇄ сервер | HTTPS (HTTP в закрытой сети), JSON; токен устройства в заголовке; долгий опрос команд; журнал полёта POST `/api/agent/runs/{id}/log`, полёт вне tbo-tracker (QGroundControl, пульт) – POST `/api/agent/flights` | агент видит только свой борт; входящие порты на борту не нужны; токен 256 бит, на сервере только хеш | [DRONE.md](DRONE.md), разделы 2, 7 |
 | MAVROS (ROS Noetic) | агент ⇄ PX4 | топики `/mavros/state`, `/mavros/imu/data`, `/mavros/global_position/*`; сервисы `mission/push`, `cmd/arming`, `set_mode`, `param/get`; simple_offboard `navigate`, `navigate_global`, `land` | нужен образ Technic или ROS Noetic с MAVROS; часть плагинов в Technic отключена (`plugin_blacklist`) | [DRONE.md](DRONE.md), разделы 4, 4а |
 | MAVLink (pymavlink) | ПК ⇄ ArduPilot / PX4 | загрузка миссии `MISSION_ITEM_INT`, перевод в AUTO | скрипт-заготовка для стенда и SITL | `scripts/run_mission_mavlink.py` |
 | Файлы миссий | сервер ⇄ наземная станция | QGroundControl `.plan` (JSON, ArduPilot и PX4), `.waypoints` (QGC WPL 110); команды 22 / 16 / 20 | локальные миссии (без GPS) в `.plan` не выгружаются | [LOG_FORMAT.md](LOG_FORMAT.md) |
@@ -37,7 +37,7 @@
 |---|---|---|
 | `/etc/tbo-agent/agent.conf` (образец `agent/tbo-agent.conf.example`) | борт | адрес сервера, сертификат, исполнитель `auto` / `mission` / `offboard`, пределы высоты, удаления, заряда и спутников |
 | `/etc/tbo-agent/token` | борт | токен устройства, права 600 |
-| `/etc/tbo-agent/ros.env` | борт | `ROS_HOSTNAME` и окружение ROS |
+| `/etc/tbo-agent/ros.env` | борт | окружение ROS, если нужно не по умолчанию (по умолчанию `ROS_MASTER_URI=http://127.0.0.1:11311`, `ROS_IP=127.0.0.1`) |
 | `agent/tbo-agent.service` | борт | служба systemd с ограничениями прав |
 | `.env` (образец `.env.example`) | сервер | база данных, адрес сайта, пределы полётов `TBO_DRONE_*`, каналы уведомлений |
 | `deploy/field/deploy.sh` | компьютер в сети | установка сервера и агента одной командой |

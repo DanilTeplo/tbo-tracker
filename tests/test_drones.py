@@ -293,6 +293,56 @@ def test_local_flight_via_agent(client, live, tmp_path):
         v.close()
 
 
+def test_flight_report_and_flightlog_reimport(client, live, tmp_path, capsys):
+    """Отчёт по полёту R N для протокола испытаний (Х1, Х2, Х3, Х5) и журнал полёта для повторной загрузки:
+    повторная загрузка распознаётся как уже учтённый полёт, наработка второй раз не начисляется."""
+    a, lid, token = link_for(client)
+    mid = local_mission(client, a["id"]).json()["id"]
+    ag, v = start_agent(live, token, tmp_path / "ag")
+    try:
+        assert wait(lambda: get(client, lid)["state"] == "idle")
+        assert client.post(f"/api/drones/{lid}/prepare", json={"mission_id": mid}).status_code == 200
+        d = wait(lambda: (lambda x: x if x["run"] and x["run"]["status"] == "ready" else None)(get(client, lid)), 20)
+        client.post(f"/api/drones/{lid}/start", json={"run_id": d["run"]["id"], "plan_hash": d["run"]["plan_hash"], "confirm": True})
+        run = wait(lambda: (lambda m: next((x for x in m["runs"] if x["status"] in ("completed", "aborted", "failed")), None))(
+            client.get(f"/api/missions/{mid}").json()), 40)
+        assert run and run["status"] == "completed" and run["import_id"], run
+    finally:
+        ag.stop()
+        v.close()
+    rid = run["id"]
+    rep = client.get(f"/api/runs/{rid}/report").json()
+    assert rep["x1"]["reached"] == rep["x1"]["total"] == 2 and rep["x1"]["pct"] == 100 and rep["x1"]["ok"]
+    assert rep["x2"]["track_points"] > 0 and all(p["miss_m"] is not None for p in rep["x2"]["points"])
+    assert rep["x2"]["max_miss_m"] <= 1.0 and rep["x2"]["ok"]
+    x3 = rep["x3"]
+    dur = x3["flight"]["duration_s"]
+    assert x3["aircraft"]["delta_cycles"] == 1 and len(x3["components"]) == 7 and x3["same_for_all"] and x3["cycles_ok"]
+    assert abs(x3["aircraft"]["delta_h"] - x3["flight"]["duration_h"]) < 1e-6 and x3["ok"] is None   # видео не задано
+    assert rep["x5"]["count"] == 0 and rep["x5"]["ok"]
+    ok = client.get(f"/api/runs/{rid}/report", params={"video_s": dur + 20}).json()["x3"]    # 20 с < 0,01 ч (36 с)
+    assert ok["ok"] and ok["max_diff_h"] < 0.01
+    assert client.get(f"/api/runs/{rid}/report", params={"video_s": dur + 60}).json()["x3"]["ok"] is False
+    md = client.get(f"/api/runs/{rid}/report", params={"fmt": "md"})
+    assert md.status_code == 200 and f"# Отчёт по полёту R{rid}" in md.text and "attachment" in md.headers["content-disposition"]
+    # журнал полёта → повторная загрузка через «Импорт журналов»: дубликат, 0 ч
+    hours = next(x for x in client.get("/api/aircraft").json() if x["id"] == a["id"])["hours"]
+    fl = client.get(f"/api/runs/{rid}/flightlog")
+    assert fl.status_code == 200 and f"flight-R{rid}-" in fl.headers["content-disposition"]
+    r = client.post("/api/imports", files={"file": (f"flight-R{rid}-{a['serial']}.json", fl.content, "application/json")}).json()
+    assert r["status"] == "duplicate" and r["flights_new"] == 0 and r["hours_added"] == 0, r
+    assert next(x for x in client.get("/api/aircraft").json() if x["id"] == a["id"])["hours"] == hours
+    assert client.get(f"/api/runs/{rid}/report").json()["reimports"][-1]["hours_added"] == 0
+    assert client.get("/api/runs/999999/report").status_code == 404
+    # командная строка сервера (sudo tbo-ctl flight-report N / flights)
+    from app.admin import main
+    assert main(["flight-report", f"R{rid}", "--video-s", str(dur)]) == 0
+    out = capsys.readouterr().out
+    assert f"# Отчёт по полёту R{rid}" in out and "| Х2 |" in out and "соответствует" in out
+    assert main(["flights", "--csv"]) == 0
+    assert f"R{rid}," in capsys.readouterr().out
+
+
 def test_admin_cli_drone_add(client, capsys):
     from app.admin import main
     from app.models import Aircraft, AircraftType
@@ -409,3 +459,110 @@ def test_online_board_not_flying_flight_can_be_closed(client):
         assert get(client, lid)["run"] is None
         with SessionLocal() as s:
             assert s.get(MissionRun, rid).status == "failed"
+
+
+def _external_log(minutes_ago=40, duration_s=300, spike_at_s=None):
+    from datetime import timedelta
+
+    from app.timeutil import utcnow
+    end = utcnow() - timedelta(minutes=minutes_ago)
+    start = end - timedelta(seconds=duration_s)
+    imu = [1.0] * (duration_s * 25)
+    if spike_at_s is not None:
+        imu[spike_at_s * 25] = 6.5
+    return {"status": "completed", "reason": "полёт вне tbo-tracker (QGroundControl / пульт)",
+            "track": [[0.0, HOME[0], HOME[1], 0.0, 0.0, "takeoff"], [5.0, HOME[0] + 0.0001, HOME[1], 8.0, 3.0, "mission"]],
+            "summary": {"duration_s": duration_s, "executor": "mission", "agent_version": "1.2.0", "external": True,
+                        "max_alt_m": 8.0},
+            "flight": {"start": start.isoformat() + "Z", "end": end.isoformat() + "Z",
+                       "imu": {"rate_hz": 25, "t0_s": 0, "accel_g": imu}, "events": []}}
+
+
+def test_flight_outside_tbo_tracker_counted_once(client):
+    """Взлёт из QGroundControl / с пульта: полёт борта без миссии — наработка и акселерометр как у обычного полёта,
+    повтор с тем же flight_id (обрыв связи после приёма) второй полёт не создаёт; арминг на земле — не полёт."""
+    from app.models import LogImport, MissionRun
+    a, lid, token = link_for(client)
+    fid = "X20261111T093000Z-ab12"
+    ext = f"{a['serial']}-{fid}"
+    with SessionLocal() as s:
+        n0 = s.query(Flight).filter_by(aircraft_id=a["id"]).count()
+        runs0 = s.query(MissionRun).filter_by(aircraft_id=a["id"]).count()
+    with TestClient(app) as dev:
+        assert dev.post("/api/agent/flights", json={**_external_log(), "flight_id": fid}).status_code == 401
+        dev.headers["Authorization"] = "Bearer " + token
+        dev.post("/api/agent/state", json={"state": "in_flight", "detail": "полёт вне tbo-tracker (QGroundControl / пульт)",
+                                           "telemetry": {"armed": True, "in_air": True}})
+        assert get(client, lid)["run"] is None                     # выполнения миссии нет
+        r = dev.post("/api/agent/flights", json={**_external_log(spike_at_s=120), "flight_id": fid})
+        assert r.status_code == 200, r.text
+        res = r.json()
+        assert res["accepted"] is True and res["already"] is False and res["external_id"] == ext
+        assert res["import"]["flights_new"] == 1 and res["import"]["hours_added"] > 0
+        with SessionLocal() as s:
+            f = s.query(Flight).filter_by(external_id=ext).one()
+            assert f.aircraft_id == a["id"] and "вне tbo-tracker" in f.mission and "QGroundControl" in f.pilot
+            assert 299 <= (f.ended_at - f.started_at).total_seconds() <= 301
+            assert [e.kind for e in s.query(SensorEvent).filter_by(flight_id=f.id)] == ["collision"]
+            imp = s.get(LogImport, f.import_id)
+            assert imp.format == "drone" and imp.summary["agent"]["flight_id"] == fid
+            assert imp.summary["agent"]["status"] == "completed" and imp.summary["agent"]["track_points"] == 2
+            assert s.query(MissionRun).filter_by(aircraft_id=a["id"]).count() == runs0
+        # повтор того же журнала и тот же номер с другим содержимым — уже учтён
+        for body in (_external_log(spike_at_s=120), _external_log(minutes_ago=39)):
+            r = dev.post("/api/agent/flights", json={**body, "flight_id": fid})
+            assert r.status_code == 200 and r.json()["already"] is True, r.text
+        with SessionLocal() as s:
+            assert s.query(Flight).filter_by(aircraft_id=a["id"]).count() == n0 + 1
+        # моторы включили и выключили на земле — полёта нет
+        r = dev.post("/api/agent/flights", json={"status": "completed", "flight": None, "track": [], "summary": {},
+                                                 "flight_id": "X20261111T094000Z-cd34"})
+        assert r.status_code == 200 and r.json()["no_flight"] is True and r.json()["import"] is None
+        with SessionLocal() as s:
+            assert s.query(Flight).filter_by(aircraft_id=a["id"]).count() == n0 + 1
+        # номер полёта задаёт агент, но только допустимыми символами
+        for bad in ("", "../R1", "X" * 65, "a b"):
+            assert dev.post("/api/agent/flights", json={**_external_log(), "flight_id": bad}).status_code == 422
+        body = _external_log(minutes_ago=20)
+        body["flight"]["end"] = body["flight"]["start"]
+        assert dev.post("/api/agent/flights", json={**body, "flight_id": "X20261111T095000Z-ef56"}).status_code == 400
+    assert any(x["action"] == "drone_flight_logged" and "вне tbo-tracker" in (x.get("details") or "")
+               for x in client.get("/api/audit?limit=50").json())
+
+
+def test_agent_client_sends_external_flight(client, live):
+    """Клиент агента (tbo_agent.client.Api.upload_flight) ↔ настоящий сервер по HTTP."""
+    a, lid, token = link_for(client)
+    api = Api(live, token, timeout=10)
+    res = api.upload_flight("X20261111T100000Z-0001", _external_log(minutes_ago=90, duration_s=120))
+    assert res["accepted"] is True and res["import"]["flights_new"] == 1
+    assert api.upload_flight("X20261111T100000Z-0001", _external_log(minutes_ago=90, duration_s=120))["already"] is True
+    with SessionLocal() as s:
+        assert s.query(Flight).filter_by(external_id=f"{a['serial']}-X20261111T100000Z-0001").count() == 1
+
+
+def test_ready_preparation_closed_when_board_flies_outside_tbo_tracker(client):
+    """План загружен («готов к старту»), а взлетели из QGroundControl: подготовка закрывается сразу, полёт борта
+    без миссии учитывается отдельно, «Старт» по старому плану уже не отправить."""
+    from app.models import MissionRun
+    a, lid, token = link_for(client)
+    mid = mission(client, a["id"])
+    with TestClient(app) as dev:
+        dev.headers["Authorization"] = "Bearer " + token
+        dev.post("/api/agent/state", json={"state": "idle"})
+        assert client.post(f"/api/drones/{lid}/prepare", json={"mission_id": mid}).status_code == 200
+        run0 = get(client, lid)["run"]
+        dev.post("/api/agent/state", json={"state": "ready", "run_id": run0["id"], "plan_hash": run0["plan_hash"]})
+        assert get(client, lid)["run"]["status"] == "ready"
+        dev.post("/api/agent/state", json={"state": "in_flight", "run_id": None,
+                                           "detail": "полёт вне tbo-tracker (QGroundControl / пульт) — запись журнала"})
+        d = get(client, lid)
+        assert d["run"] is None and d["state"] == "in_flight"
+        with SessionLocal() as s:
+            run = s.get(MissionRun, run0["id"])
+            assert run.status == "cancelled" and "вне tbo-tracker" in run.summary["error"]
+        r = client.post(f"/api/drones/{lid}/start", json={"run_id": run0["id"], "plan_hash": run0["plan_hash"], "confirm": True})
+        assert r.status_code == 400
+        assert client.post(f"/api/drones/{lid}/prepare", json={"mission_id": mid}).status_code == 400     # борт в полёте
+        r = dev.post("/api/agent/flights", json={**_external_log(minutes_ago=5, duration_s=60), "flight_id": "X20261111T110000Z-0a0b"})
+        assert r.status_code == 200 and r.json()["accepted"] is True, r.text
